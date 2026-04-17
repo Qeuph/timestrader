@@ -24,6 +24,29 @@ This open version is not an officially supported Google product.
     install timesfm==1.3.0` to install an older version of this package to load
     them.
 
+## 🚀 NEW: TimesFM Automatic Trading Bot
+
+We have integrated a complete **Automatic Trading Bot Dashboard** that uses TimesFM 2.5 for price forecasting with technical indicators as covariates (XReg).
+
+### Key Features:
+-   **Zero-Shot Forecasting**: Leverages Google's foundation model for superior price prediction.
+-   **Indicator-Aware**: Uses technical indicators (RSI, SMA, EMA, MACD, etc.) as dynamic covariates to improve forecast accuracy.
+-   **Automatic Signals**: Generates clear **BUY / SELL / HOLD** signals based on a synthesis of model forecasts and technical analysis.
+-   **Universal Markets**: Supports Stocks, Crypto, and Forex via public data sources (no API keys required).
+-   **Interactive Dashboard**: A powerful Streamlit-based UI for real-time analysis.
+
+### Quick Start (Bot):
+1.  Install dependencies:
+    ```bash
+    pip install -e .[torch,xreg] streamlit yfinance pandas-ta plotly
+    ```
+2.  Launch the dashboard:
+    ```bash
+    streamlit run src/trading_bot/app.py
+    ```
+
+---
+
 ## Update - Apr. 9, 2026
 
 Added fine-tuning example using HuggingFace Transformers + PEFT (LoRA) — see
@@ -61,6 +84,7 @@ Since the Sept. 2025 launch, the following improvements have been completed:
 3.  ✅ Documentation, examples, and agent skill (see `timesfm-forecasting/`).
 4.  ✅ Fine-tuning example with LoRA via HuggingFace Transformers + PEFT (see `timesfm-forecasting/examples/finetuning/`).
 5.  ✅ Unit tests for core layers, configs, and utilities (see `tests/`).
+6.  ✅ **Automatic Trading Bot with Streamlit Dashboard.**
 
 ### Install
 
