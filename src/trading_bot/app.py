@@ -157,6 +157,20 @@ with tab2:
     with cost_col4:
         slippage_bps = st.number_input("Slippage (bps)", min_value=0.0, max_value=100.0, value=5.0, step=0.5)
 
+    # Advanced backtest options
+    with st.expander("Advanced Backtest Options"):
+        col_adv1, col_adv2 = st.columns(2)
+        with col_adv1:
+            warmup_periods = st.number_input("Warmup Periods", min_value=0, max_value=50, value=10, step=1,
+                                            help="Number of periods to skip at start for indicator stabilization")
+            apply_position_sizing = st.checkbox("Apply Position Sizing", value=True,
+                                               help="Use suggested position sizes instead of 100% allocation")
+        with col_adv2:
+            run_monte_carlo = st.checkbox("Run Monte Carlo Simulation", value=False,
+                                         help="Run bootstrap simulation to test strategy robustness")
+            show_benchmark = st.checkbox("Show Buy & Hold Benchmark", value=True,
+                                        help="Compare strategy returns to buy-and-hold")
+
     if st.button("Run Walk-Forward Backtest"):
         progress_bar = st.progress(0)
         with st.spinner("Running simulation... this may take a minute as TimesFM re-forecasts at every step."):
@@ -174,22 +188,77 @@ with tab2:
                 holding_period_bars=int(holding_period_bars),
                 fee_bps=float(fee_bps),
                 slippage_bps=float(slippage_bps),
-                progress_bar=progress_bar
+                progress_bar=progress_bar,
+                warmup_periods=int(warmup_periods),
+                apply_position_sizing=apply_position_sizing
             )
 
             progress_bar.empty()
             if not results_df.empty:
                 metrics = backtester.calculate_metrics(results_df)
+                
+                # Calculate benchmark comparison
+                benchmark_metrics = None
+                if show_benchmark:
+                    benchmark_metrics = backtester.calculate_benchmark_returns(df, results_df)
 
+                # Run Monte Carlo if requested
+                mc_results = None
+                if run_monte_carlo:
+                    mc_results = backtester.run_monte_carlo(results_df, iterations=500)
+
+                # Display metrics
                 mcol1, mcol2, mcol3, mcol4 = st.columns(4)
                 mcol1.metric("Win Rate", f"{metrics['win_rate']}%")
                 mcol2.metric("Total PnL", f"{metrics['total_pnl_pct']}%")
                 mcol3.metric("Avg PnL/Trade", f"{metrics['avg_pnl_pct']}%")
                 mcol4.metric("Trades", metrics['total_trades'])
+                
                 mx1, mx2, mx3 = st.columns(3)
                 mx1.metric("Sharpe", metrics["sharpe_ratio"])
                 mx2.metric("Profit Factor", metrics["profit_factor"])
                 mx3.metric("Max Drawdown", f"{metrics['max_drawdown_pct']}%")
+                
+                # Show additional metrics
+                with st.expander("Additional Performance Metrics"):
+                    am1, am2, am3, am4 = st.columns(4)
+                    am1.metric("Avg Win", f"{metrics.get('avg_win_pct', 0)}%")
+                    am2.metric("Avg Loss", f"{metrics.get('avg_loss_pct', 0)}%")
+                    am3.metric("Largest Win", f"{metrics.get('largest_win_pct', 0)}%")
+                    am4.metric("Largest Loss", f"{metrics.get('largest_loss_pct', 0)}%")
+                    exp1, exp2 = st.columns(2)
+                    exp1.metric("Expectancy", f"{metrics.get('expectancy', 0)}%")
+                    exp2.metric("Position Size Avg", f"{results_df['position_size_pct'].mean():.1f}%" if 'position_size_pct' in results_df.columns else "N/A")
+
+                # Benchmark comparison
+                if benchmark_metrics:
+                    st.subheader("Benchmark Comparison")
+                    bm1, bm2, bm3 = st.columns(3)
+                    bm1.metric("Strategy Total Return", f"{metrics['total_pnl_pct']}%")
+                    bm2.metric("Buy & Hold Return", f"{benchmark_metrics['total_return_pct']}%")
+                    excess_return = metrics['total_pnl_pct'] - benchmark_metrics['total_return_pct']
+                    bm3.metric("Excess Return (Alpha)", f"{excess_return}%")
+                    
+                    # Visual comparison
+                    comp_df = pd.DataFrame({
+                        'Strategy': results_df['pnl_pct'].cumsum(),
+                        'Buy & Hold': df.loc[results_df.index[0]:results_df.index[-1], 'close'].pct_change().fillna(0).cumsum() * 100
+                    })
+                    st.line_chart(comp_df)
+
+                # Monte Carlo results
+                if mc_results:
+                    st.subheader("Monte Carlo Simulation (500 iterations)")
+                    mc1, mc2, mc3, mc4 = st.columns(4)
+                    mc1.metric("Mean Final PnL", f"{mc_results['mean_final_pnl']}%")
+                    mc2.metric("Std Dev", f"{mc_results['std_final_pnl']}%")
+                    mc3.metric("Positive Probability", f"{mc_results['probability_positive']}%")
+                    mc4.metric("Negative Probability", f"{mc_results['probability_negative']}%")
+                    
+                    # Percentile range
+                    mc_range1, mc_range2 = st.columns(2)
+                    mc_range1.metric("5th Percentile (Worst Case)", f"{mc_results['percentile_5']}%")
+                    mc_range2.metric("95th Percentile (Best Case)", f"{mc_results['percentile_95']}%")
 
                 st.subheader("Backtest Equity Curve (PnL %)")
                 results_df['cumulative_pnl'] = results_df['pnl_pct'].cumsum()
