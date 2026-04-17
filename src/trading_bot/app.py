@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+import logging
 from data_engine import DataEngine
 from forecaster import TimesFMForecast
 from strategy import SignalStrategy
@@ -8,6 +9,7 @@ from backtester import Backtester
 from portfolio import PortfolioManager
 
 st.set_page_config(page_title="TimesFM Pro Trading Bot", layout="wide")
+logging.basicConfig(level=logging.INFO)
 
 @st.cache_resource
 def get_engines():
@@ -28,6 +30,14 @@ ticker = st.sidebar.text_input("Ticker (e.g., AAPL, BTC-USD, EURUSD=X)", "BTC-US
 period = st.sidebar.selectbox("History Period", ["1mo", "3mo", "6mo", "1y", "2y", "5y"], index=3)
 interval = st.sidebar.selectbox("Interval", ["1h", "4h", "1d", "1wk"], index=2)
 horizon = st.sidebar.slider("Forecast Horizon", 5, 50, 12)
+forecast_threshold_pct = st.sidebar.slider("Forecast Threshold %", 0.1, 5.0, 1.0, 0.1)
+max_risk_per_trade_pct = st.sidebar.slider("Risk Budget %", 0.1, 5.0, 1.0, 0.1)
+max_position_size_pct = st.sidebar.slider("Max Position Size %", 1.0, 50.0, 20.0, 1.0)
+strategy.update_config(
+    forecast_threshold_pct=forecast_threshold_pct,
+    max_risk_per_trade_pct=max_risk_per_trade_pct,
+    max_position_size_pct=max_position_size_pct,
+)
 
 indicator_list = data_engine.get_indicator_list()
 selected_indicators = []
@@ -49,9 +59,13 @@ with tab1:
                 st.error(f"Failed to fetch data for {ticker}.")
             else:
                 df = data_engine.add_indicators(df)
-                point, quant = forecaster.forecast(df, horizon=horizon, covariate_cols=selected_indicators)
-                forecast_df = forecaster.get_forecast_df(df, point, quant, horizon=horizon)
+                point, quant = forecaster.forecast(
+                    df, horizon=horizon, covariate_cols=selected_indicators, strict_mode=False
+                )
+                forecast_df = forecaster.get_forecast_df(df, point, quant, horizon=horizon, interval=interval)
                 sig_data = strategy.generate_signal(df, forecast_df, selected_indicators)
+                if forecaster.last_warnings:
+                    st.warning(" | ".join(forecaster.last_warnings))
 
                 # Store in session state for persistence across button clicks
                 st.session_state.current_df = df
@@ -76,6 +90,11 @@ with tab1:
             st.markdown(f"### Signal: <span style='color:{color}'>{sig_data['signal']}</span>", unsafe_allow_html=True)
         with col4:
             st.metric("Confidence", f"{int(sig_data['confidence']*100)}%")
+        dcol1, dcol2 = st.columns(2)
+        with dcol1:
+            st.caption(f"Expected Edge: {sig_data['expected_edge']}")
+        with dcol2:
+            st.caption(f"Uncertainty Width (80%): {sig_data['uncertainty_width']}")
 
         # Metrics Row 2 (Risk Management)
         rcol1, rcol2, rcol3 = st.columns(3)
@@ -109,6 +128,16 @@ with tab1:
             portfolio.save_trade({
                 "ticker": ticker,
                 "date": df.index[-1],
+                "model_repo_id": forecaster.repo_id,
+                "period": period,
+                "interval": interval,
+                "horizon": horizon,
+                "selected_indicators": selected_indicators,
+                "strategy_config": {
+                    "forecast_threshold_pct": forecast_threshold_pct,
+                    "max_risk_per_trade_pct": max_risk_per_trade_pct,
+                    "max_position_size_pct": max_position_size_pct,
+                },
                 **sig_data
             })
             st.success("Trade saved!")
@@ -118,6 +147,15 @@ with tab2:
     st.markdown("This will simulate the bot's performance over the historical period selected in the sidebar.")
 
     backtest_days = st.slider("Backtest window (steps)", 10, 100, 30)
+    cost_col1, cost_col2, cost_col3, cost_col4 = st.columns(4)
+    with cost_col1:
+        entry_delay_bars = st.number_input("Entry Delay Bars", min_value=1, max_value=10, value=1, step=1)
+    with cost_col2:
+        holding_period_bars = st.number_input("Holding Period Bars", min_value=1, max_value=50, value=horizon, step=1)
+    with cost_col3:
+        fee_bps = st.number_input("Fee (bps)", min_value=0.0, max_value=100.0, value=5.0, step=0.5)
+    with cost_col4:
+        slippage_bps = st.number_input("Slippage (bps)", min_value=0.0, max_value=100.0, value=5.0, step=0.5)
 
     if st.button("Run Walk-Forward Backtest"):
         progress_bar = st.progress(0)
@@ -126,7 +164,18 @@ with tab2:
             df = data_engine.add_indicators(df)
 
             start_idx = len(df) - backtest_days
-            results_df = backtester.run_walk_forward(ticker, df, start_idx, horizon, selected_indicators, progress_bar=progress_bar)
+            results_df = backtester.run_walk_forward(
+                ticker=ticker,
+                df=df,
+                start_idx=start_idx,
+                horizon=horizon,
+                covariate_cols=selected_indicators,
+                entry_delay_bars=int(entry_delay_bars),
+                holding_period_bars=int(holding_period_bars),
+                fee_bps=float(fee_bps),
+                slippage_bps=float(slippage_bps),
+                progress_bar=progress_bar
+            )
 
             progress_bar.empty()
             if not results_df.empty:
@@ -137,6 +186,10 @@ with tab2:
                 mcol2.metric("Total PnL", f"{metrics['total_pnl_pct']}%")
                 mcol3.metric("Avg PnL/Trade", f"{metrics['avg_pnl_pct']}%")
                 mcol4.metric("Trades", metrics['total_trades'])
+                mx1, mx2, mx3 = st.columns(3)
+                mx1.metric("Sharpe", metrics["sharpe_ratio"])
+                mx2.metric("Profit Factor", metrics["profit_factor"])
+                mx3.metric("Max Drawdown", f"{metrics['max_drawdown_pct']}%")
 
                 st.subheader("Backtest Equity Curve (PnL %)")
                 results_df['cumulative_pnl'] = results_df['pnl_pct'].cumsum()
@@ -144,6 +197,8 @@ with tab2:
 
                 with st.expander("Detailed Backtest Logs"):
                     st.dataframe(results_df)
+                if backtester.last_errors:
+                    st.warning(f"Backtest completed with {len(backtester.last_errors)} step errors.")
 
 with tab3:
     st.subheader("Saved Trade History")
