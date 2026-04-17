@@ -1,0 +1,128 @@
+# TimesFM Trading Bot Configuration
+# Save as config.yaml
+
+# Model Configuration
+model:
+  repo_id: "google/timesfm-2.5-200m-pytorch"
+  max_context: 1024
+  max_horizon: 128
+  normalize_inputs: true
+  use_continuous_quantile_head: true
+  force_flip_invariance: true
+  infer_is_positive: true
+  fix_quantile_crossing: true
+  return_backcast: true
+
+# Strategy Configuration
+strategy:
+  # Dynamic threshold settings
+  base_threshold_pct: 1.0
+  volatility_adaptive: true
+  volatility_lookback: 20
+  threshold_multiplier: 1.5
+  
+  # Signal synthesis weights
+  timesfm_weight: 0.6
+  technical_weight: 0.4
+  next_step_weight: 0.4
+  horizon_weight: 0.6
+  
+  # Multi-timeframe confirmation
+  enable_mtf_confirmation: true
+  mtf_timeframes: ["1h", "4h", "1d"]
+  mtf_agreement_required: 2
+  
+  # Regime detection
+  enable_regime_detection: true
+  regime_lookback: 50
+  trending_threshold: 0.5
+  
+  # Position sizing
+  risk_per_trade_pct: 1.0
+  max_position_size_pct: 20.0
+  use_kelly_criterion: true
+  kelly_fraction: 0.25  # Quarter-Kelly for safety
+  confidence_scaling: true
+  
+  # Risk Management
+  stop_loss_atr_multiple: 2.0
+  take_profit_atr_multiple: 4.0
+  enable_trailing_stop: true
+  trailing_stop_atr_multiple: 1.5
+  max_drawdown_cutoff_pct: 15.0
+  volatility_target_pct: 10.0
+
+# Backtester Configuration
+backtester:
+  entry_delay_bars: 1
+  holding_period_bars: null  # null = use horizon
+  fee_bps: 5.0
+  slippage_bps: 5.0
+  
+  # Monte Carlo simulation
+  enable_monte_carlo: true
+  monte_carlo_iterations: 1000
+  bootstrap_resampling: true
+  
+  # Walk-forward validation
+  warmup_periods: 50
+  out_of_sample_ratio: 0.3
+  
+  # Benchmark comparison
+  benchmark: "buy_and_hold"
+  
+# Forecaster Configuration
+forecaster:
+  enable_ensemble: true
+  ensemble_models:
+    - "google/timesfm-2.5-200m-pytorch"
+  enable_caching: true
+  cache_ttl_seconds: 3600
+  covariate_imputation: true
+  imputation_method: "last_value"  # last_value, linear, mean
+  
+# Portfolio Configuration
+portfolio:
+  storage_backend: "json"  # json or sqlite
+  sqlite_path: "trades.db"
+  max_correlation_exposure: 0.7
+  sector_limits:
+    technology: 30.0
+    finance: 25.0
+    energy: 20.0
+    crypto: 15.0
+    commodities: 10.0
+  
+  # Circuit breakers
+  daily_loss_limit_pct: 5.0
+  weekly_loss_limit_pct: 10.0
+  monthly_loss_limit_pct: 15.0
+  
+# UI/UX Configuration
+ui:
+  auto_refresh_seconds: 60
+  enable_alerts: true
+  alert_channels:
+    - "email"
+    - "discord"
+  email_smtp_server: "smtp.gmail.com"
+  email_smtp_port: 587
+  discord_webhook_url: ""
+  watchlist:
+    - "BTC-USD"
+    - "ETH-USD"
+    - "AAPL"
+    - "SPY"
+    - "GLD"
+    - "EURUSD=X"
+  export_formats:
+    - "csv"
+    - "excel"
+    
+# Logging Configuration
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "trading_bot.log"
+  max_size_mb: 10
+  backup_count: 5
