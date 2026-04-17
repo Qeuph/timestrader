@@ -148,27 +148,40 @@ class SignalStrategy:
         
         close = df['close']
         
-        # Trend detection using moving averages
+        # Volatility regime first
+        current_volatility = self._calculate_volatility(df)
+        historical_volatility = df['close'].pct_change().dropna().std() * np.sqrt(252)
+
+        if current_volatility > historical_volatility * 1.5:
+            return MarketRegime.HIGH_VOLATILITY
+
+        # Trend detection using moving averages and ADX if available
+        is_trending_up = False
+        is_trending_down = False
+
         if 'SMA_20' in df.columns and 'SMA_50' in df.columns:
             sma_20 = df['SMA_20'].iloc[-1]
             sma_50 = df['SMA_50'].iloc[-1]
             sma_20_prev = df['SMA_20'].iloc[-5] if len(df) > 5 else sma_20
             sma_50_prev = df['SMA_50'].iloc[-5] if len(df) > 5 else sma_50
             
-            # Strong uptrend: SMA20 > SMA50 and both rising
-            if sma_20 > sma_50 and sma_20 > sma_20_prev and sma_50 > sma_50_prev:
-                return MarketRegime.TRENDING_UP
-            # Strong downtrend: SMA20 < SMA50 and both falling
-            elif sma_20 < sma_50 and sma_20 < sma_20_prev and sma_50 < sma_50_prev:
-                return MarketRegime.TRENDING_DOWN
+            if sma_20 > sma_50 and sma_20 > sma_20_prev:
+                is_trending_up = True
+            elif sma_20 < sma_50 and sma_20 < sma_20_prev:
+                is_trending_down = True
+
+        # ADX refinement
+        if 'ADX_14' in df.columns:
+            adx = df['ADX_14'].iloc[-1]
+            if adx < 20: # Weak trend
+                return MarketRegime.LOW_VOLATILITY if current_volatility < historical_volatility * 0.8 else MarketRegime.RANGING
+
+        if is_trending_up:
+            return MarketRegime.TRENDING_UP
+        if is_trending_down:
+            return MarketRegime.TRENDING_DOWN
         
-        # Volatility regime
-        current_volatility = self._calculate_volatility(df)
-        historical_volatility = df['close'].pct_change().dropna().std() * np.sqrt(252)
-        
-        if current_volatility > historical_volatility * 1.5:
-            return MarketRegime.HIGH_VOLATILITY
-        elif current_volatility < historical_volatility * 0.7:
+        if current_volatility < historical_volatility * 0.7:
             return MarketRegime.LOW_VOLATILITY
         
         return MarketRegime.RANGING
@@ -192,33 +205,45 @@ class SignalStrategy:
 
     def _multi_timeframe_confirmation(self, ticker: str, data_engine, 
                                        selected_indicators: list, 
-                                       horizon: int = 12) -> Tuple[bool, int]:
+                                       is_buy: bool,
+                                       current_time: pd.Timestamp = None) -> Tuple[bool, int]:
         """Check for signal confirmation across multiple timeframes."""
-        if not self.enable_mtf_confirmation:
+        if not self.enable_mtf_confirmation or not data_engine or not ticker:
             return True, 0
         
         timeframes = ["1h", "4h", "1d"]
         confirmations = 0
-        total_signals = 0
+        valid_timeframes = 0
         
         for tf in timeframes:
             try:
-                # Fetch data for this timeframe
-                tf_df = data_engine.fetch_data(ticker, period="3mo", interval=tf)
-                if tf_df is None or tf_df.empty:
+                # Use current_time to avoid look-ahead bias if provided (for backtesting)
+                if current_time:
+                    # Fetch more data to ensure we have enough for indicators
+                    tf_df = data_engine.fetch_data(ticker, end=current_time, interval=tf)
+                else:
+                    tf_df = data_engine.fetch_data(ticker, period="1mo", interval=tf)
+
+                if tf_df is None or len(tf_df) < 20:
                     continue
                 
                 tf_df = data_engine.add_indicators(tf_df)
+                valid_timeframes += 1
                 
-                # Simple trend check for this timeframe
+                # Trend check: SMA20 > SMA50 for BUY, SMA20 < SMA50 for SELL
                 if 'SMA_20' in tf_df.columns and 'SMA_50' in tf_df.columns:
-                    total_signals += 1
-                    if tf_df['SMA_20'].iloc[-1] > tf_df['SMA_50'].iloc[-1]:
+                    sma20 = tf_df['SMA_20'].iloc[-1]
+                    sma50 = tf_df['SMA_50'].iloc[-1]
+                    if is_buy and sma20 > sma50:
+                        confirmations += 1
+                    elif not is_buy and sma20 < sma50:
                         confirmations += 1
             except Exception:
                 continue
         
-        return confirmations >= 2, confirmations  # Require at least 2 timeframes agreeing
+        # Confirmed if more than half of valid timeframes agree
+        is_confirmed = confirmations >= (valid_timeframes / 2) if valid_timeframes > 0 else True
+        return is_confirmed, confirmations
 
     def _calculate_trailing_stop(self, df: pd.DataFrame, entry_price: float, 
                                   is_long: bool) -> Optional[float]:
@@ -249,7 +274,8 @@ class SignalStrategy:
                         data_engine=None,
                         ticker: str = None,
                         horizon: int = 12,
-                        historical_trades: List[Dict] = None) -> SignalResult:
+                        historical_trades: List[Dict] = None,
+                        current_time: pd.Timestamp = None) -> SignalResult:
         """
         Generate a Buy/Sell/Hold signal with enhanced features:
         - Dynamic volatility-adaptive thresholds
@@ -344,17 +370,7 @@ class SignalStrategy:
         combined_score = (self.timesfm_weight * timesfm_signal) + \
                         (self.technical_weight * norm_tech)
 
-        # Multi-timeframe confirmation bonus
-        mtf_confirmed = False
-        mtf_count = 0
-        if self.enable_mtf_confirmation and data_engine and ticker:
-            mtf_confirmed, mtf_count = self._multi_timeframe_confirmation(
-                ticker, data_engine, selected_indicators, horizon
-            )
-            if mtf_confirmed:
-                combined_score *= 1.1  # 10% boost for MTF confirmation
-
-        # Determine signal with dynamic threshold
+        # Determine initial signal and confidence
         signal = "HOLD"
         interval_width = float(
             max(
@@ -379,6 +395,20 @@ class SignalStrategy:
             signal = "BUY"
         elif combined_score < -signal_threshold:
             signal = "SELL"
+
+        # Multi-timeframe confirmation
+        mtf_confirmed = True
+        mtf_count = 0
+        if signal != "HOLD" and self.enable_mtf_confirmation and data_engine and ticker:
+            mtf_confirmed, mtf_count = self._multi_timeframe_confirmation(
+                ticker, data_engine, selected_indicators,
+                is_buy=(signal == "BUY"),
+                current_time=current_time or df.index[-1]
+            )
+            if not mtf_confirmed:
+                signal = "HOLD"  # Downgrade to HOLD if not confirmed
+            else:
+                confidence = min(1.0, confidence * 1.1) # Boost confidence if confirmed
 
         # Risk Management: SL/TP based on ATR
         atr_col = 'ATR_14' if 'ATR_14' in df.columns else 'ATRr_14'

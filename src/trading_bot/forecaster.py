@@ -84,19 +84,16 @@ class TimesFMForecast:
 
                 if target_col in df.columns:
                     context_values = df[target_col].values.astype(np.float32)
-                    # Known-future covariates can be carried as-is for horizon.
-                    # Unknown-future technical indicators are excluded by default.
+
                     if self._is_known_future_covariate(target_col):
+                        # For time-based covariates that might be in the columns
                         horizon_values = np.repeat(context_values[-1], horizon).astype(np.float32)
-                        full_values = np.concatenate([context_values, horizon_values])
-                        dynamic_numerical_covariates[target_col] = [full_values]
                     else:
-                        warning_msg = (
-                            f"Skipped unknown-future covariate '{col}'. "
-                            "Technical indicators are path-dependent and not known for future horizon."
-                        )
-                        self.last_warnings.append(warning_msg)
-                        self.logger.warning(warning_msg)
+                        # Project technical indicators using a moving average trend
+                        horizon_values = self._project_unknown_covariate(context_values, horizon)
+
+                    full_values = np.concatenate([context_values, horizon_values])
+                    dynamic_numerical_covariates[target_col] = [full_values]
                 else:
                     warning_msg = f"Covariate column '{col}' not found in DataFrame."
                     self.last_warnings.append(warning_msg)
@@ -180,3 +177,29 @@ class TimesFMForecast:
     def _is_known_future_covariate(self, col_name: str):
         known_prefixes = ("day_", "month", "is_", "holiday", "weekday", "hour")
         return col_name.lower().startswith(known_prefixes)
+
+    def _project_unknown_covariate(self, context_values: np.ndarray, horizon: int) -> np.ndarray:
+        """
+        Project unknown-future covariates (like technical indicators) for the horizon.
+        Uses a simple moving average trend from the last 5 points.
+        """
+        if len(context_values) < 5:
+            return np.repeat(context_values[-1], horizon).astype(np.float32)
+
+        recent_values = context_values[-5:]
+        # Calculate average step (velocity)
+        steps = np.diff(recent_values)
+        avg_step = np.mean(steps)
+
+        # Project using the average step
+        projections = []
+        current_val = context_values[-1]
+        for _ in range(horizon):
+            current_val += avg_step
+            projections.append(current_val)
+
+        # Optional: Bound certain indicators (e.g., RSI between 0-100)
+        # But since we don't necessarily know the indicator type here,
+        # we'll keep it simple or add specific logic if needed.
+
+        return np.array(projections).astype(np.float32)
