@@ -13,15 +13,24 @@ class SignalStrategy:
         """
         Generate a Buy/Sell/Hold signal based on TimesFM forecast and technical indicators.
         """
-        latest_price = df['close'].iloc[-1]
-        predicted_price = forecast_df['point_forecast'].iloc[0] # Next step prediction
-        predicted_change = (predicted_price - latest_price) / latest_price
+        latest_price = float(df['close'].iloc[-1])
 
-        # TimesFM Signal
+        # Multi-horizon Analysis: Look at the mean of the forecast horizon
+        predicted_price_next = float(forecast_df['point_forecast'].iloc[0])
+        avg_predicted_price = float(forecast_df['point_forecast'].mean())
+
+        # Calculate changes for both next-step and full-horizon
+        predicted_change_next = (predicted_price_next - latest_price) / latest_price
+        predicted_change_horizon = (avg_predicted_price - latest_price) / latest_price
+
+        # Combined TimesFM Signal (Weighted average of next-step and horizon trend)
+        # We give 40% weight to immediate next step and 60% to the overall horizon trend
+        combined_forecast_change = (0.4 * predicted_change_next) + (0.6 * predicted_change_horizon)
+
         timesfm_signal = 0
-        if predicted_change > 0.01: # 1% expected gain
+        if combined_forecast_change > 0.01: # 1% expected gain
             timesfm_signal = 1
-        elif predicted_change < -0.01: # 1% expected loss
+        elif combined_forecast_change < -0.01: # 1% expected loss
             timesfm_signal = -1
 
         # Technical Indicators Signal
@@ -73,11 +82,53 @@ class SignalStrategy:
         elif combined_score < -0.3:
             signal = "SELL"
 
+        # Risk Management: SL/TP based on ATR
+        atr_col = 'ATR_14' if 'ATR_14' in df.columns else 'ATRr_14'
+        if atr_col in df.columns:
+            atr = float(df[atr_col].iloc[-1])
+            if signal == "BUY":
+                stop_loss = latest_price - (2 * atr)
+                take_profit = latest_price + (4 * atr)
+            elif signal == "SELL":
+                stop_loss = latest_price + (2 * atr)
+                take_profit = latest_price - (4 * atr)
+            else:
+                stop_loss = None
+                take_profit = None
+        else:
+            # Fallback if ATR is missing
+            if signal == "BUY":
+                stop_loss = latest_price * 0.95
+                take_profit = latest_price * 1.10
+            elif signal == "SELL":
+                stop_loss = latest_price * 1.05
+                take_profit = latest_price * 0.90
+            else:
+                stop_loss = None
+                take_profit = None
+
+        # Position Sizing: Confidence + Volatility (Inverse of ATR)
+        # Higher confidence -> larger size
+        # Higher volatility (ATR) -> smaller size
+        if signal != "HOLD" and atr_col in df.columns:
+            # Normalize ATR relative to price
+            volatility_ratio = (df[atr_col].iloc[-1] / latest_price)
+            # Simple heuristic: base size 10%, adjusted by confidence, penalized by volatility
+            suggested_size_pct = (confidence * 20) / (volatility_ratio * 100)
+            suggested_size_pct = min(max(suggested_size_pct, 1.0), 100.0) # Clamp between 1% and 100%
+        elif signal != "HOLD":
+            suggested_size_pct = confidence * 50
+        else:
+            suggested_size_pct = 0
+
         return {
             "signal": signal,
             "confidence": round(confidence, 2),
-            "timesfm_change_pct": round(predicted_change * 100, 2),
+            "timesfm_change_pct": round(combined_forecast_change * 100, 2),
             "tech_score": round(norm_tech, 2),
-            "latest_price": round(float(latest_price), 2),
-            "predicted_next": round(float(predicted_price), 2)
+            "latest_price": round(latest_price, 2),
+            "predicted_next": round(predicted_price_next, 2),
+            "stop_loss": round(stop_loss, 2) if stop_loss else None,
+            "take_profit": round(take_profit, 2) if take_profit else None,
+            "suggested_size_pct": round(suggested_size_pct, 1)
         }

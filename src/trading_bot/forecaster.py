@@ -74,8 +74,18 @@ class TimesFMForecast:
 
                 if target_col in df.columns:
                     context_values = df[target_col].values.astype(np.float32)
-                    # Extend with last value for the horizon
-                    horizon_values = np.full(horizon, context_values[-1], dtype=np.float32)
+                    # Project future values using a simple moving average trend
+                    # Calculate the recent trend (last 5 points)
+                    if len(context_values) >= 5:
+                        recent_change = (context_values[-1] - context_values[-5]) / 5
+                    else:
+                        recent_change = 0
+
+                    # Create projected values for the horizon
+                    horizon_values = np.zeros(horizon, dtype=np.float32)
+                    for i in range(horizon):
+                        horizon_values[i] = context_values[-1] + (recent_change * (i + 1))
+
                     full_values = np.concatenate([context_values, horizon_values])
                     dynamic_numerical_covariates[target_col] = [full_values]
                 else:
