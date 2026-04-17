@@ -3,8 +3,21 @@ import numpy as np
 from typing import Dict, Any
 
 class SignalStrategy:
-    def __init__(self):
-        pass
+    def __init__(self,
+                 forecast_threshold_pct: float = 1.0,
+                 max_risk_per_trade_pct: float = 1.0,
+                 max_position_size_pct: float = 20.0):
+        self.forecast_threshold_pct = forecast_threshold_pct
+        self.max_risk_per_trade_pct = max_risk_per_trade_pct
+        self.max_position_size_pct = max_position_size_pct
+
+    def update_config(self,
+                      forecast_threshold_pct: float,
+                      max_risk_per_trade_pct: float,
+                      max_position_size_pct: float):
+        self.forecast_threshold_pct = forecast_threshold_pct
+        self.max_risk_per_trade_pct = max_risk_per_trade_pct
+        self.max_position_size_pct = max_position_size_pct
 
     def generate_signal(self,
                         df: pd.DataFrame,
@@ -27,10 +40,11 @@ class SignalStrategy:
         # We give 40% weight to immediate next step and 60% to the overall horizon trend
         combined_forecast_change = (0.4 * predicted_change_next) + (0.6 * predicted_change_horizon)
 
+        threshold = self.forecast_threshold_pct / 100.0
         timesfm_signal = 0
-        if combined_forecast_change > 0.01: # 1% expected gain
+        if combined_forecast_change > threshold:
             timesfm_signal = 1
-        elif combined_forecast_change < -0.01: # 1% expected loss
+        elif combined_forecast_change < -threshold:
             timesfm_signal = -1
 
         # Technical Indicators Signal
@@ -75,7 +89,15 @@ class SignalStrategy:
         combined_score = (0.6 * timesfm_signal) + (0.4 * norm_tech)
 
         signal = "HOLD"
-        confidence = abs(combined_score)
+        interval_width = float(
+            max(
+                forecast_df['upper_80'].iloc[0] - forecast_df['lower_80'].iloc[0],
+                1e-8,
+            )
+        )
+        expected_edge = abs(predicted_price_next - latest_price)
+        uncertainty_score = min(expected_edge / interval_width, 3.0) / 3.0
+        confidence = min(1.0, 0.5 * abs(combined_score) + 0.5 * uncertainty_score)
 
         if combined_score > 0.3:
             signal = "BUY"
@@ -107,19 +129,17 @@ class SignalStrategy:
                 stop_loss = None
                 take_profit = None
 
-        # Position Sizing: Confidence + Volatility (Inverse of ATR)
-        # Higher confidence -> larger size
-        # Higher volatility (ATR) -> smaller size
-        if signal != "HOLD" and atr_col in df.columns:
-            # Normalize ATR relative to price
-            volatility_ratio = (df[atr_col].iloc[-1] / latest_price)
-            # Simple heuristic: base size 10%, adjusted by confidence, penalized by volatility
-            suggested_size_pct = (confidence * 20) / (volatility_ratio * 100)
-            suggested_size_pct = min(max(suggested_size_pct, 1.0), 100.0) # Clamp between 1% and 100%
-        elif signal != "HOLD":
-            suggested_size_pct = confidence * 50
+        # Position Sizing: risk-based sizing using stop distance and risk budget
+        risk_budget_pct = self.max_risk_per_trade_pct
+        if signal != "HOLD" and stop_loss is not None:
+            stop_distance_pct = abs((latest_price - stop_loss) / latest_price) * 100.0
+            risk_per_unit = max(stop_distance_pct, 1e-6)
+            raw_size = (risk_budget_pct / risk_per_unit) * 100.0
+            suggested_size_pct = raw_size * confidence
+            suggested_size_pct = min(max(suggested_size_pct, 0.0), self.max_position_size_pct)
         else:
             suggested_size_pct = 0
+            risk_per_unit = 0.0
 
         return {
             "signal": signal,
@@ -128,6 +148,9 @@ class SignalStrategy:
             "tech_score": round(norm_tech, 2),
             "latest_price": round(latest_price, 2),
             "predicted_next": round(predicted_price_next, 2),
+            "expected_edge": round(expected_edge, 4),
+            "uncertainty_width": round(interval_width, 4),
+            "risk_per_unit": round(risk_per_unit, 4),
             "stop_loss": round(stop_loss, 2) if stop_loss else None,
             "take_profit": round(take_profit, 2) if take_profit else None,
             "suggested_size_pct": round(suggested_size_pct, 1)

@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import timesfm
 import pandas as pd
+import logging
 from typing import List, Dict, Optional
 
 class TimesFMForecast:
@@ -9,6 +10,8 @@ class TimesFMForecast:
         self.repo_id = repo_id
         self.model = None
         self.forecast_config = None
+        self.logger = logging.getLogger(__name__)
+        self.last_warnings = []
 
     def load_model(self):
         """
@@ -36,7 +39,8 @@ class TimesFMForecast:
     def forecast(self,
                  df: pd.DataFrame,
                  horizon: int = 12,
-                 covariate_cols: Optional[List[str]] = None):
+                 covariate_cols: Optional[List[str]] = None,
+                 strict_mode: bool = False):
         """
         Perform forecasting with TimesFM.
         If covariate_cols are provided, uses forecast_with_covariates (XReg).
@@ -50,6 +54,7 @@ class TimesFMForecast:
         # Prepare inputs
         close_prices = df['close'].values.astype(np.float32)
 
+        self.last_warnings = []
         if not covariate_cols:
             # Simple forecast
             point_forecast, quantile_forecast = self.model.forecast(
@@ -66,6 +71,11 @@ class TimesFMForecast:
             # However, TimesFM XReg requires them for the horizon.
 
             dynamic_numerical_covariates = {}
+            interval = df.attrs.get("interval")
+            freq = self._resolve_forecast_frequency(df, interval)
+            known_future_covs = self._build_known_future_covariates(df.index, horizon, freq)
+            dynamic_numerical_covariates.update(known_future_covs)
+
             for col in covariate_cols:
                 # Try exact match first, then lowercase
                 target_col = col
@@ -74,26 +84,32 @@ class TimesFMForecast:
 
                 if target_col in df.columns:
                     context_values = df[target_col].values.astype(np.float32)
-                    # Project future values using a simple moving average trend
-                    # Calculate the recent trend (last 5 points)
-                    if len(context_values) >= 5:
-                        recent_change = (context_values[-1] - context_values[-5]) / 5
+                    # Known-future covariates can be carried as-is for horizon.
+                    # Unknown-future technical indicators are excluded by default.
+                    if self._is_known_future_covariate(target_col):
+                        horizon_values = np.repeat(context_values[-1], horizon).astype(np.float32)
+                        full_values = np.concatenate([context_values, horizon_values])
+                        dynamic_numerical_covariates[target_col] = [full_values]
                     else:
-                        recent_change = 0
-
-                    # Create projected values for the horizon
-                    horizon_values = np.zeros(horizon, dtype=np.float32)
-                    for i in range(horizon):
-                        horizon_values[i] = context_values[-1] + (recent_change * (i + 1))
-
-                    full_values = np.concatenate([context_values, horizon_values])
-                    dynamic_numerical_covariates[target_col] = [full_values]
+                        warning_msg = (
+                            f"Skipped unknown-future covariate '{col}'. "
+                            "Technical indicators are path-dependent and not known for future horizon."
+                        )
+                        self.last_warnings.append(warning_msg)
+                        self.logger.warning(warning_msg)
                 else:
-                    print(f"Warning: Covariate column {col} not found in DataFrame.")
+                    warning_msg = f"Covariate column '{col}' not found in DataFrame."
+                    self.last_warnings.append(warning_msg)
+                    self.logger.warning(warning_msg)
+
+            if strict_mode and self.last_warnings:
+                raise ValueError("Strict mode enabled and one or more covariates were invalid/unknown.")
 
             if not dynamic_numerical_covariates:
                 # Fallback to simple forecast if no covariates were found
-                print("No valid covariates found. Falling back to simple forecast.")
+                warning_msg = "No valid covariates found. Falling back to simple forecast."
+                self.last_warnings.append(warning_msg)
+                self.logger.warning(warning_msg)
                 point_forecast, quantile_forecast = self.model.forecast(
                     horizon=horizon,
                     inputs=[close_prices]
@@ -114,21 +130,14 @@ class TimesFMForecast:
                         df: pd.DataFrame,
                         point_forecast: np.ndarray,
                         quantile_forecast: np.ndarray,
-                        horizon: int):
+                        horizon: int,
+                        interval: Optional[str] = None):
         """
         Combine historical data and forecast into a single DataFrame for visualization.
         """
         last_date = df.index[-1]
 
-        # Robustly determine frequency
-        if hasattr(df.index, 'freq') and df.index.freq is not None:
-            freq = df.index.freq
-        else:
-            freq = pd.infer_freq(df.index)
-
-        if freq is None:
-            # Fallback to calculating the difference between last two timestamps
-            freq = df.index[-1] - df.index[-2]
+        freq = self._resolve_forecast_frequency(df, interval or df.attrs.get("interval"))
 
         forecast_dates = pd.date_range(start=last_date, periods=horizon + 1, freq=freq)[1:]
 
@@ -140,3 +149,34 @@ class TimesFMForecast:
         forecast_df['upper_80'] = quantile_forecast[0, :horizon, 9]
 
         return forecast_df
+
+    def _resolve_forecast_frequency(self, df: pd.DataFrame, interval: Optional[str]):
+        interval_map = {
+            "1h": "1H",
+            "4h": "4H",
+            "1d": "1D",
+            "1wk": "1W",
+            "1mo": "1M",
+        }
+        if interval in interval_map:
+            return interval_map[interval]
+        if hasattr(df.index, "freq") and df.index.freq is not None:
+            return df.index.freq
+        inferred = pd.infer_freq(df.index)
+        if inferred is not None:
+            return inferred
+        return df.index[-1] - df.index[-2]
+
+    def _build_known_future_covariates(self, index: pd.Index, horizon: int, freq):
+        last_date = index[-1]
+        future_index = pd.date_range(start=last_date, periods=horizon + 1, freq=freq)[1:]
+        full_index = index.append(future_index)
+        return {
+            "day_of_week": [full_index.dayofweek.astype(np.float32).values],
+            "month": [full_index.month.astype(np.float32).values],
+            "is_month_end": [full_index.is_month_end.astype(np.float32).values],
+        }
+
+    def _is_known_future_covariate(self, col_name: str):
+        known_prefixes = ("day_", "month", "is_", "holiday", "weekday", "hour")
+        return col_name.lower().startswith(known_prefixes)

@@ -1,10 +1,11 @@
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
+import logging
 
 class DataEngine:
     def __init__(self):
-        pass
+        self.logger = logging.getLogger(__name__)
 
     def fetch_data(self, ticker: str, period: str = "1y", interval: str = "1d"):
         """
@@ -13,6 +14,15 @@ class DataEngine:
         df = yf.download(ticker, period=period, interval=interval)
         if df.empty:
             return None
+        if not isinstance(df.index, pd.DatetimeIndex):
+            raise ValueError("Expected DatetimeIndex from market data source.")
+        df = df.sort_index()
+        df = df[~df.index.duplicated(keep="last")]
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        else:
+            df.index = df.index.tz_convert("UTC")
+        df.attrs["interval"] = interval
         return df
 
     def add_indicators(self, df: pd.DataFrame):
@@ -25,6 +35,14 @@ class DataEngine:
 
         # Ensure column names are lowercase for pandas-ta
         df.columns = [str(col).lower() for col in df.columns]
+
+        if not df.index.is_monotonic_increasing:
+            df = df.sort_index()
+        if df.index.duplicated().any():
+            self.logger.warning("Found duplicated timestamps; keeping latest entries.")
+            df = df[~df.index.duplicated(keep="last")]
+        if len(df) < 60:
+            raise ValueError("Insufficient history for indicator computation (need at least 60 rows).")
 
         # Trend Indicators
         df.ta.sma(length=20, append=True)
