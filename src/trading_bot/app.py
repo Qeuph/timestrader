@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import logging
+from dataclasses import asdict
 from data_engine import DataEngine
 from forecaster import TimesFMForecast
 from strategy import SignalStrategy
@@ -33,10 +34,17 @@ horizon = st.sidebar.slider("Forecast Horizon", 5, 50, 12)
 forecast_threshold_pct = st.sidebar.slider("Forecast Threshold %", 0.1, 5.0, 1.0, 0.1)
 max_risk_per_trade_pct = st.sidebar.slider("Risk Budget %", 0.1, 5.0, 1.0, 0.1)
 max_position_size_pct = st.sidebar.slider("Max Position Size %", 1.0, 50.0, 20.0, 1.0)
+enable_mtf = st.sidebar.checkbox("Enable MTF Confirmation", value=False)
+enable_regime = st.sidebar.checkbox("Enable Regime-Adaptive", value=True)
+use_kelly = st.sidebar.checkbox("Use Kelly Criterion", value=False)
+
 strategy.update_config(
     forecast_threshold_pct=forecast_threshold_pct,
     max_risk_per_trade_pct=max_risk_per_trade_pct,
     max_position_size_pct=max_position_size_pct,
+    enable_mtf_confirmation=enable_mtf,
+    enable_regime_detection=enable_regime,
+    use_kelly_criterion=use_kelly
 )
 
 indicator_list = data_engine.get_indicator_list()
@@ -63,7 +71,11 @@ with tab1:
                     df, horizon=horizon, covariate_cols=selected_indicators, strict_mode=False
                 )
                 forecast_df = forecaster.get_forecast_df(df, point, quant, horizon=horizon, interval=interval)
-                sig_data = strategy.generate_signal(df, forecast_df, selected_indicators)
+                sig_result = strategy.generate_signal(
+                    df, forecast_df, selected_indicators,
+                    data_engine=data_engine, ticker=ticker
+                )
+                sig_data = asdict(sig_result)
                 if forecaster.last_warnings:
                     st.warning(" | ".join(forecaster.last_warnings))
 
@@ -90,20 +102,29 @@ with tab1:
             st.markdown(f"### Signal: <span style='color:{color}'>{sig_data['signal']}</span>", unsafe_allow_html=True)
         with col4:
             st.metric("Confidence", f"{int(sig_data['confidence']*100)}%")
-        dcol1, dcol2 = st.columns(2)
+
+        dcol1, dcol2, dcol3, dcol4 = st.columns(4)
         with dcol1:
             st.caption(f"Expected Edge: {sig_data['expected_edge']}")
         with dcol2:
-            st.caption(f"Uncertainty Width (80%): {sig_data['uncertainty_width']}")
+            st.caption(f"Uncertainty Width: {sig_data['uncertainty_width']}")
+        with dcol3:
+            st.caption(f"Market Regime: **{sig_data['market_regime'].upper()}**")
+        with dcol4:
+            confirm_str = "✅ Confirmed" if sig_data['mtf_confirmation'] else "❌ Not Confirmed"
+            st.caption(f"MTF Status: {confirm_str}")
 
         # Metrics Row 2 (Risk Management)
-        rcol1, rcol2, rcol3 = st.columns(3)
+        rcol1, rcol2, rcol3, rcol4 = st.columns(4)
         with rcol1:
             st.info(f"**Stop Loss:** {sig_data['stop_loss']}")
         with rcol2:
             st.success(f"**Take Profit:** {sig_data['take_profit']}")
         with rcol3:
             st.warning(f"**Suggested Size:** {sig_data['suggested_size_pct']}%")
+        with rcol4:
+            if sig_data['kelly_size_pct']:
+                st.help(f"Kelly Size: {sig_data['kelly_size_pct']}%")
 
         # Visualization
         fig = go.Figure()
@@ -214,10 +235,11 @@ with tab2:
                 mcol3.metric("Avg PnL/Trade", f"{metrics['avg_pnl_pct']}%")
                 mcol4.metric("Trades", metrics['total_trades'])
                 
-                mx1, mx2, mx3 = st.columns(3)
+                mx1, mx2, mx3, mx4 = st.columns(4)
                 mx1.metric("Sharpe", metrics["sharpe_ratio"])
-                mx2.metric("Profit Factor", metrics["profit_factor"])
-                mx3.metric("Max Drawdown", f"{metrics['max_drawdown_pct']}%")
+                mx2.metric("Sortino", metrics.get("sortino_ratio", "N/A"))
+                mx3.metric("Profit Factor", metrics["profit_factor"])
+                mx4.metric("Max Drawdown", f"{metrics['max_drawdown_pct']}%")
                 
                 # Show additional metrics
                 with st.expander("Additional Performance Metrics"):

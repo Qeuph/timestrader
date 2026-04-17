@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import logging
 from typing import Dict, Any, List, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 
 
 @dataclass
@@ -48,6 +48,9 @@ class Backtester:
         cumulative_pnl = 0.0
         trade_history = []
         
+        # Cache for forecasts to speed up backtest
+        forecast_cache = {}
+
         for i in range(start_idx + warmup_periods, len(df)):
             if progress_bar:
                 progress_bar.progress((i - start_idx) / total_steps)
@@ -59,53 +62,70 @@ class Backtester:
                 continue
 
             try:
-                point, quant = self.forecaster.forecast(current_df, horizon=horizon, covariate_cols=covariate_cols)
+                # Use cache key based on last index and horizon
+                cache_key = (current_df.index[-1], horizon, tuple(covariate_cols or []))
+                if cache_key in forecast_cache:
+                    point, quant = forecast_cache[cache_key]
+                else:
+                    point, quant = self.forecaster.forecast(current_df, horizon=horizon, covariate_cols=covariate_cols)
+                    forecast_cache[cache_key] = (point, quant)
+
                 forecast_df = self.forecaster.get_forecast_df(
                     current_df, point, quant, horizon=horizon, interval=df.attrs.get("interval")
                 )
 
                 # Pass historical trades for Kelly criterion calculation
-                sig_data = self.strategy.generate_signal(
+                sig_result = self.strategy.generate_signal(
                     current_df, 
                     forecast_df, 
                     covariate_cols,
-                    historical_trades=trade_history[-20:] if trade_history else None
+                    historical_trades=trade_history[-20:] if trade_history else None,
+                    data_engine=self.data_engine,
+                    ticker=ticker,
+                    current_time=current_df.index[-1]
                 )
+                sig_data = asdict(sig_result)
 
                 entry_price = self._get_execution_price(df, entry_idx)
-                exit_price = self._get_execution_price(df, exit_idx)
+
+                # Real-time simulation of exit (check SL/TP before holding period ends)
+                exit_price, exit_reason = self._simulate_exit(
+                    df, entry_idx, exit_idx, entry_price,
+                    sig_result.stop_loss, sig_result.take_profit,
+                    is_long=(sig_result.signal == "BUY")
+                )
                 
                 # Calculate gross return
                 gross_return = 0.0
-                if sig_data.signal == "BUY":
+                if sig_result.signal == "BUY":
                     gross_return = (exit_price - entry_price) / entry_price
-                elif sig_data.signal == "SELL":
+                elif sig_result.signal == "SELL":
                     gross_return = (entry_price - exit_price) / entry_price
 
                 # Apply costs
-                cost_decimal = 2 * ((fee_bps + slippage_bps) / 10000.0) if sig_data.signal != "HOLD" else 0.0
+                cost_decimal = 2 * ((fee_bps + slippage_bps) / 10000.0) if sig_result.signal != "HOLD" else 0.0
                 net_return = gross_return - cost_decimal
                 
                 # Apply position sizing to returns
-                if apply_position_sizing and sig_data.signal != "HOLD":
-                    position_size_pct = sig_data.suggested_size_pct / 100.0
+                if apply_position_sizing and sig_result.signal != "HOLD":
+                    position_size_pct = sig_result.suggested_size_pct / 100.0
                     net_return = net_return * position_size_pct
 
                 res = {
-                    'signal': sig_data.signal,
-                    'confidence': sig_data.confidence,
-                    'timesfm_change_pct': sig_data.timesfm_change_pct,
-                    'tech_score': sig_data.tech_score,
-                    'latest_price': sig_data.latest_price,
-                    'predicted_next': sig_data.predicted_next,
-                    'expected_edge': sig_data.expected_edge,
-                    'uncertainty_width': sig_data.uncertainty_width,
-                    'risk_per_unit': sig_data.risk_per_unit,
-                    'stop_loss': sig_data.stop_loss,
-                    'take_profit': sig_data.take_profit,
-                    'suggested_size_pct': sig_data.suggested_size_pct,
-                    'trailing_stop': sig_data.trailing_stop,
-                    'market_regime': sig_data.market_regime,
+                    'signal': sig_result.signal,
+                    'confidence': sig_result.confidence,
+                    'timesfm_change_pct': sig_result.timesfm_change_pct,
+                    'tech_score': sig_result.tech_score,
+                    'latest_price': sig_result.latest_price,
+                    'predicted_next': sig_result.predicted_next,
+                    'expected_edge': sig_result.expected_edge,
+                    'uncertainty_width': sig_result.uncertainty_width,
+                    'risk_per_unit': sig_result.risk_per_unit,
+                    'stop_loss': sig_result.stop_loss,
+                    'take_profit': sig_result.take_profit,
+                    'suggested_size_pct': sig_result.suggested_size_pct,
+                    'trailing_stop': sig_result.trailing_stop,
+                    'market_regime': sig_result.market_regime,
                     'date': df.index[i],
                     'entry_date': df.index[entry_idx],
                     'exit_date': df.index[exit_idx],
@@ -122,7 +142,7 @@ class Backtester:
                 results.append(res)
                 
                 # Update cumulative PnL and trade history
-                if sig_data.signal != "HOLD":
+                if sig_result.signal != "HOLD":
                     cumulative_pnl += net_return * 100
                     trade_history.append(res)
 
@@ -220,11 +240,11 @@ class Backtester:
         if results_df.empty:
             return {}
 
-        total_trades = len(results_df[results_df['signal'] != "HOLD"])
+        trade_results = results_df[results_df['signal'] != "HOLD"].copy()
+        total_trades = len(trade_results)
         if total_trades == 0:
             return {"total_trades": 0}
 
-        trade_results = results_df[results_df['signal'] != "HOLD"].copy()
         winning_trades = len(trade_results[trade_results['net_pnl_pct'] > 0])
         win_rate = winning_trades / total_trades if total_trades > 0 else 0
 
@@ -237,11 +257,19 @@ class Backtester:
         trade_returns = trade_results['net_pnl_pct'] / 100.0
         avg_return = trade_returns.mean()
         std_pnl = trade_returns.std()
+
+        # Sharpe Ratio
         sharpe = (avg_return / std_pnl) * np.sqrt(252) if std_pnl != 0 else 0
         
+        # Sortino Ratio
+        downside_returns = trade_returns[trade_returns < 0]
+        downside_std = downside_returns.std()
+        sortino = (avg_return / downside_std) * np.sqrt(252) if downside_std > 0 else (sharpe if avg_return > 0 else 0)
+
         # Calculate cumulative returns and drawdown
-        cum = trade_results['net_pnl_pct'].cumsum()
-        drawdown = cum - cum.cummax()
+        cum_pnl = trade_results['net_pnl_pct'].cumsum()
+        rolling_max = cum_pnl.cummax()
+        drawdown = cum_pnl - rolling_max
         max_drawdown = drawdown.min() if not drawdown.empty else 0
         
         # Additional metrics
@@ -260,6 +288,7 @@ class Backtester:
             "total_pnl_pct": round(total_pnl, 2),
             "avg_pnl_pct": round(avg_pnl, 2),
             "sharpe_ratio": round(sharpe, 2),
+            "sortino_ratio": round(sortino, 2),
             "profit_factor": round(float(profit_factor), 2) if np.isfinite(profit_factor) else "inf",
             "max_drawdown_pct": round(float(max_drawdown), 2),
             "avg_win_pct": round(avg_win, 2) if avg_win else 0,
@@ -268,6 +297,28 @@ class Backtester:
             "largest_loss_pct": round(largest_loss, 2),
             "expectancy": round(avg_pnl * win_rate + avg_loss * (1 - win_rate), 2) if avg_loss else round(avg_pnl * win_rate, 2)
         }
+
+    def _simulate_exit(self, df, entry_idx, target_exit_idx, entry_price, sl, tp, is_long):
+        """Simulates price movement between entry and exit to check for SL/TP hits."""
+        for j in range(entry_idx + 1, target_exit_idx + 1):
+            if j >= len(df):
+                break
+
+            low = df['low'].iloc[j]
+            high = df['high'].iloc[j]
+
+            if is_long:
+                if sl and low <= sl:
+                    return sl, "SL"
+                if tp and high >= tp:
+                    return tp, "TP"
+            else:
+                if sl and high >= sl:
+                    return sl, "SL"
+                if tp and low <= tp:
+                    return tp, "TP"
+
+        return self._get_execution_price(df, target_exit_idx), "Target"
 
     def _get_execution_price(self, df: pd.DataFrame, idx: int):
         if 'open' in df.columns:
